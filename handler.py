@@ -101,6 +101,24 @@ def mode_pod():
 
     jeton = os.environ.get("ATELIER_TOKEN", "")
     travaux, file = {}, queue.Queue()
+    activite = [time.time()]
+
+    def veilleur():
+        """Sécurité : sans aucune demande pendant ARRET_INACTIF minutes, le Pod se supprime lui-même (plus aucun frais).
+        RunPod fournit au Pod son identifiant et une clé limitée à lui-même (RUNPOD_POD_ID, RUNPOD_API_KEY)."""
+        minutes = float(os.environ.get("ARRET_INACTIF", "30"))
+        pod, cle = os.environ.get("RUNPOD_POD_ID"), os.environ.get("RUNPOD_API_KEY")
+        while minutes > 0 and pod and cle:
+            time.sleep(60)
+            occupe = any(t["etat"] in ("en file", "en cours") for t in travaux.values())
+            if not occupe and time.time() - activite[0] > minutes * 60:
+                print(f"[atelier] inactif depuis {minutes:.0f} min : suppression du Pod", flush=True)
+                req = urllib.request.Request(f"https://rest.runpod.io/v1/pods/{pod}", method="DELETE", headers={"Authorization": f"Bearer {cle}"})
+                try:
+                    urllib.request.urlopen(req, timeout=30)
+                except Exception as e:
+                    print(f"[atelier] suppression impossible : {e}", flush=True)
+                return
 
     def ouvrier():
         PRET.wait()
@@ -124,8 +142,9 @@ def mode_pod():
             return not jeton or self.headers.get("Authorization") == f"Bearer {jeton}"
 
         def do_GET(self):
-            if self.path == "/sante":
+            if self.path == "/sante":  # consulter l'état ne compte pas comme une activité
                 return self.repondre(200, {"pret": PRET.is_set(), "carte": torch.cuda.get_device_name(0), "file": file.qsize()})
+            activite[0] = time.time()
             if not self.autorise():
                 return self.repondre(401, {"erreur": "jeton"})
             if self.path.startswith("/travaux/"):
@@ -134,6 +153,7 @@ def mode_pod():
             self.repondre(404, {"erreur": "chemin"})
 
         def do_POST(self):
+            activite[0] = time.time()
             if not self.autorise():
                 return self.repondre(401, {"erreur": "jeton"})
             if self.path != "/travaux":
@@ -149,6 +169,7 @@ def mode_pod():
 
     threading.Thread(target=charger, daemon=True).start()
     threading.Thread(target=ouvrier, daemon=True).start()
+    threading.Thread(target=veilleur, daemon=True).start()
     print("[atelier] serveur du Pod sur le port 8000", flush=True)
     ThreadingHTTPServer(("0.0.0.0", 8000), Accueil).serve_forever()
 

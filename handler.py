@@ -9,7 +9,8 @@ Deux façons de tourner :
         GET  /travaux/<id>     → {"etat": "en file|en cours|fini|échec", ...résultat}
   - Serverless RunPod (par défaut).
 
-Réglages : image_base64 (ou image_url), seed (42), resolution ("1024_cascade" ; "512", "1024", "1536_cascade"),
+Réglages : image_base64 (ou image_url), ou plusieurs vues du même sujet : images_base64 [face, profil, dos…] avec
+multi = "alterne" (une vue par pas de calcul) | "moyenne" (toutes les vues à chaque pas, plus lent) ; seed (42), resolution ("1024_cascade" ; "512", "1024", "1536_cascade"),
 decimation (60000), texture_size (1024).
 Résultat : {"ok": true, "glb_gzip_base64": "...", "octets": n, "secondes": {...}}  ou  {"ok": false, "erreur": "..."}
 """
@@ -47,6 +48,37 @@ def avancer(cle, frac=0.0, detail=""):
                    pct=min(99, round(debut + poids * max(0.0, min(1.0, frac)))))
 
 
+# Plusieurs vues (astuce de TRELLIS v1, sans réentraînement) : le modèle ne connaît qu'une image à la fois ; on lui
+# présente les vues tour à tour (« alterne ») ou on fait la moyenne de ses prédictions sur toutes (« moyenne »).
+MULTI = {"mode": None, "pas": -1, "t": None}
+
+
+def brancher_multi_vues():
+    from trellis2.pipelines.samplers.flow_euler import FlowEulerSampler
+    base = FlowEulerSampler._inference_model
+
+    def inference(self, model, x_t, t, cond=None, **kw):
+        n = cond.shape[0] if torch.is_tensor(cond) else 1
+        if MULTI["mode"] is None or n <= 1:
+            return base(self, model, x_t, t, cond, **kw)
+        if MULTI["mode"] == "alterne":
+            if t != MULTI["t"]:  # nouveau pas (le guidage appelle deux fois par pas : on garde la même vue)
+                MULTI["t"], MULTI["pas"] = t, MULTI["pas"] + 1
+            i = MULTI["pas"] % n
+            return base(self, model, x_t, t, cond[i:i + 1], **kw)
+        return sum(base(self, model, x_t, t, cond[i:i + 1], **kw) for i in range(n)) / n
+
+    FlowEulerSampler._inference_model = inference
+    get_cond = PIPELINE.get_cond
+
+    def get_cond_vues(image, resolution, include_neg_cond=True):
+        if isinstance(image, list) and len(image) == 1 and isinstance(image[0], list):
+            image = image[0]  # run() emballe l'image dans une liste : ici, c'est déjà la liste des vues
+        return get_cond(image, resolution, include_neg_cond)
+
+    PIPELINE.get_cond = get_cond_vues
+
+
 def suivre_pas():
     """Les échantillonneurs de TRELLIS comptent leurs pas avec tqdm : on écoute ce compte."""
     import trellis2.pipelines.samplers.flow_euler as fe
@@ -76,6 +108,7 @@ def charger():
     PIPELINE = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
     PIPELINE.cuda()
     suivre_pas()
+    brancher_multi_vues()
     decode = PIPELINE.decode_latent
 
     def decode_suivi(*a, **k):
@@ -87,32 +120,42 @@ def charger():
     print(f"[atelier] prêt en {time.time() - t0:.0f} s sur {torch.cuda.get_device_name(0)}", flush=True)
 
 
+def decoder(b64):
+    if b64.startswith("data:"):
+        b64 = b64.split(",", 1)[1]
+    return Image.open(io.BytesIO(base64.b64decode(b64))).convert("RGBA")
+
+
 def lire_image(inp):
     if inp.get("image_url"):
         with urllib.request.urlopen(inp["image_url"], timeout=60) as r:
-            data = r.read()
-    else:
-        b64 = inp["image_base64"]
-        if b64.startswith("data:"):
-            b64 = b64.split(",", 1)[1]
-        data = base64.b64decode(b64)
-    return Image.open(io.BytesIO(data)).convert("RGBA")
+            return Image.open(io.BytesIO(r.read())).convert("RGBA")
+    return decoder(inp["image_base64"])
 
 
 def fabriquer(inp, limite=None):
     import o_voxel
     try:
-        if not (inp.get("image_base64") or inp.get("image_url")):
-            return {"ok": False, "erreur": "image_base64 ou image_url requis"}
+        vues = inp.get("images_base64") or []
+        if not (vues or inp.get("image_base64") or inp.get("image_url")):
+            return {"ok": False, "erreur": "image_base64, images_base64 ou image_url requis"}
         t = {}
         a = time.time()
         resolution = inp.get("resolution", "1024_cascade")
         PROGRES.clear()
         PROGRES["passes_forme"] = 2 if "cascade" in resolution else 1
         avancer("prep")
-        image = lire_image(inp)
-        with torch.inference_mode():
-            mesh = PIPELINE.run(image, seed=int(inp.get("seed", 42)), pipeline_type=resolution)[0]
+        if len(vues) > 1:
+            image = [PIPELINE.preprocess_image(decoder(v)) for v in vues]  # chaque vue détourée et cadrée
+            MULTI.update(mode="moyenne" if inp.get("multi") == "moyenne" else "alterne", pas=-1, t=None)
+        else:
+            image = decoder(vues[0]) if vues else lire_image(inp)
+            MULTI["mode"] = None
+        try:
+            with torch.inference_mode():
+                mesh = PIPELINE.run(image, seed=int(inp.get("seed", 42)), pipeline_type=resolution, preprocess_image=len(vues) <= 1)[0]
+        finally:
+            MULTI["mode"] = None
         t["generation"] = round(time.time() - a, 1)
         a = time.time()
         avancer("export", 0.05, "simplification")

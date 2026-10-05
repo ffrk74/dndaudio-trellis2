@@ -33,6 +33,38 @@ from PIL import Image
 
 PIPELINE = None
 PRET = threading.Event()
+
+# Avancement de la fabrication en cours (lu par GET /travaux/<id>) : étape, pas de calcul, pourcentage.
+ETAPES = [("prep", "Préparation de l'image", 4), ("structure", "Structure", 12), ("forme", "Forme", 34),
+          ("textures", "Textures", 26), ("decodage", "Décodage", 9), ("export", "Export du modèle", 15)]
+PROGRES = {}
+
+
+def avancer(cle, frac=0.0, detail=""):
+    i = [k for k, _, _ in ETAPES].index(cle)
+    debut, poids = sum(w for _, _, w in ETAPES[:i]), ETAPES[i][2]
+    PROGRES.update(cle=cle, etape=ETAPES[i][1], numero=i + 1, total=len(ETAPES), detail=detail,
+                   pct=min(99, round(debut + poids * max(0.0, min(1.0, frac)))))
+
+
+def suivre_pas():
+    """Les échantillonneurs de TRELLIS comptent leurs pas avec tqdm : on écoute ce compte."""
+    import trellis2.pipelines.samplers.flow_euler as fe
+
+    def compteur(it, desc="", disable=False, **_):
+        items = list(it)
+        cle = "structure" if "sparse" in desc else "forme" if "shape" in desc else "textures" if "texture" in desc else None
+        passe = 0
+        if cle == "forme":  # en cascade, la forme se fait en deux passes (basse puis haute résolution)
+            passe = PROGRES.get("passes_forme_faites", 0)
+            PROGRES["passes_forme_faites"] = passe + 1
+        nb = PROGRES.get("passes_forme", 1) if cle == "forme" else 1
+        for i, x in enumerate(items):
+            if cle:
+                avancer(cle, (passe + i / max(1, len(items))) / nb, f"pas {i + 1}/{len(items)}" + (f" · passe {passe + 1}/{nb}" if nb > 1 else ""))
+            yield x
+
+    fe.tqdm = compteur
 MAX_SORTIE = 10 * 1024 * 1024 - 64 * 1024  # réponse Serverless : on reste sous 10 Mo
 
 
@@ -43,6 +75,14 @@ def charger():
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
     PIPELINE = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
     PIPELINE.cuda()
+    suivre_pas()
+    decode = PIPELINE.decode_latent
+
+    def decode_suivi(*a, **k):
+        avancer("decodage", 0.1)
+        return decode(*a, **k)
+
+    PIPELINE.decode_latent = decode_suivi
     PRET.set()
     print(f"[atelier] prêt en {time.time() - t0:.0f} s sur {torch.cuda.get_device_name(0)}", flush=True)
 
@@ -66,12 +106,18 @@ def fabriquer(inp, limite=None):
             return {"ok": False, "erreur": "image_base64 ou image_url requis"}
         t = {}
         a = time.time()
+        resolution = inp.get("resolution", "1024_cascade")
+        PROGRES.clear()
+        PROGRES["passes_forme"] = 2 if "cascade" in resolution else 1
+        avancer("prep")
         image = lire_image(inp)
         with torch.inference_mode():
-            mesh = PIPELINE.run(image, seed=int(inp.get("seed", 42)), pipeline_type=inp.get("resolution", "1024_cascade"))[0]
+            mesh = PIPELINE.run(image, seed=int(inp.get("seed", 42)), pipeline_type=resolution)[0]
         t["generation"] = round(time.time() - a, 1)
         a = time.time()
+        avancer("export", 0.05, "simplification")
         mesh.simplify(16_777_216)  # limite de nvdiffrast
+        avancer("export", 0.3, "dépliage et cuisson des textures")
         glb = o_voxel.postprocess.to_glb(
             vertices=mesh.vertices, faces=mesh.faces, attr_volume=mesh.attrs, coords=mesh.coords,
             attr_layout=mesh.layout, voxel_size=mesh.voxel_size, aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
@@ -149,7 +195,16 @@ def mode_pod():
                 return self.repondre(401, {"erreur": "jeton"})
             if self.path.startswith("/travaux/"):
                 t = travaux.get(self.path.split("/")[-1])
-                return self.repondre(200, t) if t else self.repondre(404, {"erreur": "inconnu"})
+                if not t:
+                    return self.repondre(404, {"erreur": "inconnu"})
+                vue = {k: v for k, v in t.items() if k != "entree"}
+                if t["etat"] == "en cours":
+                    vue["progres"] = {k: v for k, v in PROGRES.items() if not k.startswith("passes")}
+                    vue["ecoule"] = round(time.time() - t["debut"])
+                elif t["etat"] == "en file":
+                    vue["position"] = sum(1 for x in travaux.values() if x["etat"] == "en file" and x["cree"] <= t["cree"])
+                    vue["pret"] = PRET.is_set()
+                return self.repondre(200, vue)
             self.repondre(404, {"erreur": "chemin"})
 
         def do_POST(self):

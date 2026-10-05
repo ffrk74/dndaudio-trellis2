@@ -5,11 +5,15 @@
 FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 
 SHELL ["/bin/bash", "-c"]
+# Compilation : seulement les cartes visées (A40, A5000, 3090 = 8.6 ; L4, 4090 = 8.9), et peu de tâches
+# en parallèle (la machine de construction n'a que 16 Go de mémoire).
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda-12.4 \
     PATH=/opt/conda/bin:$PATH \
-    TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" \
-    FORCE_CUDA=1
+    TORCH_CUDA_ARCH_LIST="8.6;8.9" \
+    FORCE_CUDA=1 \
+    MAX_JOBS=2 \
+    NVCC_THREADS=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends git wget curl build-essential ninja-build libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*

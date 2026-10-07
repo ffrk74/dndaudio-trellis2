@@ -5,12 +5,12 @@
 FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
 
 SHELL ["/bin/bash", "-c"]
-# Compilation : seulement les cartes visées (A40, A5000, 3090 = 8.6 ; L4, 4090 = 8.9), et peu de tâches
+# Compilation : seulement les cartes visées (A40, A6000, A5000, 3090 = 8.6 ; L40, 4090 = 8.9 ; H100, H200 = 9.0), et peu de tâches
 # en parallèle (la machine de construction n'a que 16 Go de mémoire).
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda-12.4 \
     PATH=/opt/conda/bin:$PATH \
-    TORCH_CUDA_ARCH_LIST="8.6;8.9" \
+    TORCH_CUDA_ARCH_LIST="8.6;8.9;9.0" \
     FORCE_CUDA=1 \
     MAX_JOBS=2 \
     NVCC_THREADS=1

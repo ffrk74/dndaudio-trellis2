@@ -7,4 +7,7 @@ Modèle : [microsoft/TRELLIS.2](https://github.com/microsoft/TRELLIS.2) (MIT). U
 
 - Construction : GitHub Actions publie `ghcr.io/<compte>/<dépôt>:<commit>` à chaque envoi sur `main`.
 - Service RunPod : GPU A40 (48 Go), Workers Min 0, Workers Max 1, Idle Timeout court.
-- Entrée : `image_base64` ou `image_url`, `seed`, `resolution`, `decimation`, `texture_size` (voir `handler.py`).
+- Entrée : `image_base64` ou `image_url`, `seed`, `resolution`, `decimation`, `texture_size`, `steps` et `guidance`
+  (étapes et guidage des phases structure / forme / textures), `max_tokens` (voir `handler.py`).
+- Pod : les modèles restent sur la carte (≥ 32 Go) ; plusieurs fabrications à la fois selon la mémoire (80 Go : deux
+  en haute qualité ou quatre essais en 512 ; 48 Go : une, ou deux essais) ; reprise seule en cas de manque de mémoire.
